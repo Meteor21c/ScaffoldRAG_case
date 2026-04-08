@@ -2,6 +2,7 @@ import json
 import logging
 import pdb
 import time
+import copy
 from typing import List, Dict, Tuple, Any
 from src.models.base_rag import BaseRAG
 from src.utils.utils import get_response_with_retry, fix_json_response
@@ -17,24 +18,54 @@ logger = logging.getLogger(__name__)
 
 class LogicRAG(BaseRAG):
 
-    def __init__(self, corpus_path: str = None, cache_dir: str = "./cache", filter_repeats: bool = False):
+    def __init__(
+            self,
+            corpus_path: str = None,
+            cache_dir: str = "./cache",
+            filter_repeats: bool = False,
+            perturbation_enabled: bool = False,
+            perturbation_type: str = "none",
+            perturbation_step_mode: str = "first_reasoning_step",
+            save_history: bool = False,
+            experiment_tag: str = "baseline",
+    ):
         """Initialize the LogicRAG system."""
         super().__init__(corpus_path, cache_dir)
-        self.max_rounds = 3  # Default max rounds for iterative retrieval
+        self.max_rounds = 3
         self.MODEL_NAME = "LogicRAG"
-        self.filter_repeats = filter_repeats  # Option to filter repeated chunks across rounds
+        self.filter_repeats = filter_repeats
+
+        # ===== Experiment config =====
+        self.perturbation_enabled = perturbation_enabled
+        self.perturbation_type = perturbation_type
+        self.perturbation_step_mode = perturbation_step_mode
+        self.save_history = save_history
+        self.experiment_tag = experiment_tag
+
+        self.answer_wrong_template = (
+            "This step incorrectly identifies the answer as a different entity or event."
+        )
+        self.summary_wrong_template = (
+            "The evidence is incorrectly summarized around a misleading conclusion rather than the actual key fact."
+        )
+
+        # ===== Runtime logs =====
+        self.last_dependency_analysis = []
+        self.last_history = []
+        self.last_run_metadata = {}
+        self.last_perturbed_step_info = None
+        self.last_retrieval_history = []
 
     def set_max_rounds(self, max_rounds: int):
         """Set the maximum number of retrieval rounds."""
         self.max_rounds = max_rounds
-
 
     def process_step(self, global_question: str, sub_query: str, contexts: List[str]) -> Dict[str, str]:
         """
         处理单个推理步骤：对检索内容进行总结，并尝试回答子问题。
 
         Args:
-            global_question: 用户最原始的问题 (用于保持上下文目标)
+            global_question: 用户最原始的问题
             sub_query: 当前步骤的子查询
             contexts: 当前步骤检索到的 top-k 文档
 
@@ -43,8 +74,6 @@ class LogicRAG(BaseRAG):
         """
         context_text = "\n".join(contexts)
 
-        # 构建 Prompt，要求同时输出总结和直接答案
-        # 这里使用了 JSON 格式输出，便于程序解析存储
         prompt = f"""
         You are an intelligent reasoning agent. 
         Global Goal: Answer the question "{global_question}"
@@ -66,10 +95,9 @@ class LogicRAG(BaseRAG):
             response = get_response_with_retry(prompt)
             result = fix_json_response(response)
 
-            # 简单的错误处理，防止解析失败
             if not result or "summary" not in result:
                 return {
-                    "summary": context_text[:500] + "...",  # Fallback
+                    "summary": context_text[:500] + "...",
                     "answer": "Could not parse answer."
                 }
             return result
@@ -83,17 +111,12 @@ class LogicRAG(BaseRAG):
 
     def warm_up_analysis(self, question: str, history: List[Dict]) -> Dict:
         """
-                Warm-up analysis: Analyze if the initial retrieval (Step 0) is sufficient.
-
-                Args:
-                    question: The global question.
-                    history: The structured history (containing the initial attempt).
-                """
-        # 1. 格式化历史信息 (复用我们定义的工具函数)
+        Warm-up analysis: Analyze if the initial retrieval (Step 0) is sufficient.
+        """
         history_text = self._format_history_for_llm(history)
         try:
             prompt = f"""
-            
+
             Global Question: {question}
 
             Current Knowledge (from Initial Retrieval):
@@ -116,14 +139,9 @@ Please format your response as a JSON object with these keys:
 - "missing_reason": string (brief explanation why info is missing, max 20 words)"""
 
             response = get_response_with_retry(prompt)
-
-            # Clean up response to ensure it's valid JSON
             response = response.strip()
-
-            # Remove any markdown code block markers
             response = response.replace('```json', '').replace('```', '')
 
-            # Parse the cleaned response using fix_json_response
             result = fix_json_response(response)
             if result is None:
                 return {
@@ -135,23 +153,19 @@ Please format your response as a JSON object with these keys:
                     "missing_reason": "Parse error occurred"
                 }
 
-            # Validate required fields
             required_fields = ["can_answer", "missing_info", "subquery", "current_understanding"]
             if not all(field in result for field in required_fields):
                 logger.error(f"{Fore.RED}Missing required fields in response: {response}{Style.RESET_ALL}")
                 raise ValueError("Missing required fields")
 
-            # Add default values for new interpretability fields if missing
             if "dependencies" not in result:
                 result["dependencies"] = ["Information relevant to the question"]
             if "missing_reason" not in result:
                 result["missing_reason"] = "Additional context needed" if not result[
                     "can_answer"] else "No missing information"
 
-            # Ensure boolean type for can_answer
             result["can_answer"] = bool(result["can_answer"])
 
-            # Ensure non-empty subquery
             if not result["subquery"]:
                 result["subquery"] = question
 
@@ -168,12 +182,10 @@ Please format your response as a JSON object with these keys:
                 "missing_reason": "Analysis error occurred"
             }
 
-
     def dependency_aware_rag(self, question: str, history: List[Dict], dependencies: List[str], idx: int) -> Dict:
         """
         Analyze if the question can be answered given the structured history.
         """
-        # 1. 格式化历史信息
         history_text = self._format_history_for_llm(history)
 
         try:
@@ -200,12 +212,12 @@ Please format your response as a JSON object with these keys:
              """
             response = get_response_with_retry(prompt)
             result = fix_json_response(response)
-            # 【修复重点】增加空值检查
+
             if result is None:
                 logger.warning(
                     f"{Fore.YELLOW}dependency_aware_rag received invalid JSON. Using fallback.{Style.RESET_ALL}")
                 return {
-                    "can_answer": False,  # 解析失败时保守起见认为不能回答，继续检索
+                    "can_answer": False,
                     "current_understanding": "Failed to parse dependency analysis response."
                 }
 
@@ -213,22 +225,21 @@ Please format your response as a JSON object with these keys:
         except Exception as e:
             logger.error(f"{Fore.RED}Error in dependency_aware_rag: {e}{Style.RESET_ALL}")
             return {
-                "can_answer": False,  # 安全起见，出错时不轻易停止
+                "can_answer": False,
                 "current_understanding": f"Error during analysis: {str(e)}",
             }
-
 
     def generate_answer(self, question: str, history: List[Dict]) -> str:
         """Generate final answer based on the reasoning chain."""
         history_text = self._format_history_for_llm(history)
 
         debug_message = history_text
-        print(debug_message)  ####################################  debug
+        print(debug_message)
 
         try:
             prompt = f"""
             You are a strict answer generator. You must generate the final answer based on the provided reasoning process.
-            
+
             Question: {question}
 
             Reasoning Process:
@@ -239,11 +250,11 @@ Please format your response as a JSON object with these keys:
             2. If the answer is a name, date, or number, output JUST that entity.
             3. If the answer is a simple yes/no, just say "Yes" or "No".
             4. If the answer requires a brief phrase, make it as concise as possible.
-                       
-            Concise Answer: """
 
-            print(f'''  - Final Answer:{get_response_with_retry(prompt)}''')
-            return get_response_with_retry(prompt)
+            Concise Answer: """
+            answer =get_response_with_retry(prompt)
+            print(f'''  - Final Answer:{answer}''')
+            return answer
         except Exception as e:
             logger.error(f"{Fore.RED}Error generating answer: {e}{Style.RESET_ALL}")
             return ""
@@ -251,46 +262,8 @@ Please format your response as a JSON object with these keys:
     def _sort_dependencies(self, dependencies: List[str], query) -> List[Tuple]:
         """
         given a list of dependencies and the original query,
-        sort the dependencies in a topological order, that is solving a dependency A relies on the solution of the dependent dependency B,
-        then B should be before A in the sorted string.
-
-        Args:
-            dependencies: List[str]
-            query: str
-
-            
-        For example, if the question is "What is the mayor of the capital of France?",
-        the input dependencies for this question are:
-        - The capital of France
-        - The mayor of this capital
-
-        Then the output should be:
-        - The capital of France
-        - The mayor of this capital
-
-        there are two steps to solve this problem:
-        1. generate the dependency pairs that dependency A relies on dependency B
-        2. use graph-based algorithm to sort the dependencies in a topological order
-
-        For example, answering the question "What is the mayor of the capital of France?"
-        the input dependencies are:
-        - The capital of France
-        - The mayor of this capital
-
-        Then the dependency pairs are:
-        - [(1, 0)]
-        because the mayor of the capital of France relies on the capital of France
-
-        Then the topological order is computed by the self._topological_sort function, which is a graph-based algorithm. The output is a list of indices of the dependencies in the topological order.
-        In this case, the output is:
-        [0, 1]
-
-        The sorted dependencies are thus:
-        - The capital of France
-        - The mayor of this capital
+        sort the dependencies in a topological order.
         """
-
-        # Step 1: generate the dependency pairs by prompting LLMs
         prompt = f"""
         Given the question:
         Question: {query}
@@ -307,7 +280,6 @@ Please format your response as a JSON object with these keys:
         result = fix_json_response(response)
         dependency_pairs = result["dependency_pairs"]
 
-        # Step 2: use graph-based algorithm to sort the dependencies in a topological order
         sorted_dependencies = self._topological_sort(dependencies, dependency_pairs)
         return sorted_dependencies
 
@@ -315,11 +287,6 @@ Please format your response as a JSON object with these keys:
     def _topological_sort(dependencies: List[str], dependencies_pairs: List[Tuple[int, int]]) -> List[str]:
         """
         Use graph-based algorithm to sort the dependencies in a topological order.
-        Args:
-            dependencies: List[str]
-            dependencies_pairs: List[Tuple[int, int]]
-        Returns:
-            List[str]
         """
         graph = {dep: [] for dep in dependencies}
 
@@ -327,7 +294,7 @@ Please format your response as a JSON object with these keys:
             if dependent_idx < len(dependencies) and dependency_idx < len(dependencies):
                 dependent = dependencies[dependent_idx]
                 dependency = dependencies[dependency_idx]
-                graph[dependency].append(dependent)  # dependency -> dependent
+                graph[dependency].append(dependent)
 
         visited = set()
         stack = []
@@ -348,14 +315,12 @@ Please format your response as a JSON object with these keys:
 
     def _retrieve_with_filter(self, query: str, retrieved_chunks_set: set) -> list:
         """
-        Retrieve top_k unique chunks not in retrieved_chunks_set. If not enough unique chunks, return as many as possible.
+        Retrieve top_k unique chunks not in retrieved_chunks_set.
         """
         all_results = self.retrieve(query)
         unique_results = []
         idx = self.top_k
-        # If not enough unique in top_k, keep expanding
         while len(unique_results) < self.top_k and idx <= len(self.corpus):
-            # Expand retrieval window
             all_results = self.retrieve(query) if idx == self.top_k else self._retrieve_top_n(query, idx)
             unique_results = [chunk for chunk in all_results if chunk not in retrieved_chunks_set]
             idx += self.top_k
@@ -363,27 +328,79 @@ Please format your response as a JSON object with these keys:
 
     def _retrieve_top_n(self, query: str, n: int) -> list:
         """Retrieve top-n results for a query (helper for filtering)."""
-        # Temporarily override top_k
         old_top_k = self.top_k
         self.top_k = n
         results = self.retrieve(query)
         self.top_k = old_top_k
         return results
 
+    # ===== New: perturbation helpers =====
+    def _is_target_perturbation_step(self, step_type: str, reasoning_step_index: int) -> bool:
+        if not self.perturbation_enabled:
+            return False
+        if self.perturbation_type == "none":
+            return False
+        if step_type != "reasoning_step":
+            return False
+        if self.perturbation_step_mode == "first_reasoning_step":
+            return reasoning_step_index == 0
+        return False
+
+    def _maybe_perturb_step_result(self, step_result: Dict[str, str], step_type: str, reasoning_step_index: int):
+        original_summary = step_result.get("summary", "")
+        original_answer = step_result.get("answer", "")
+
+        perturbation_log = {
+            "perturbation_applied": False,
+            "perturbation_enabled": self.perturbation_enabled,
+            "perturbation_type": self.perturbation_type,
+            "perturbation_step_mode": self.perturbation_step_mode,
+            "target_step_type": step_type,
+            "target_reasoning_step_index": reasoning_step_index,
+            "original_summary": original_summary,
+            "original_answer": original_answer,
+            "perturbed_summary": original_summary,
+            "perturbed_answer": original_answer,
+        }
+
+        if not self._is_target_perturbation_step(step_type, reasoning_step_index):
+            return step_result, perturbation_log
+
+        perturbed_result = copy.deepcopy(step_result)
+
+        if self.perturbation_type == "answer_wrong":
+            perturbed_result["answer"] = self.answer_wrong_template
+            perturbation_log["perturbation_applied"] = True
+            perturbation_log["perturbed_answer"] = perturbed_result["answer"]
+
+        elif self.perturbation_type == "summary_wrong":
+            perturbed_result["summary"] = self.summary_wrong_template
+            perturbation_log["perturbation_applied"] = True
+            perturbation_log["perturbed_summary"] = perturbed_result["summary"]
+
+        return perturbed_result, perturbation_log
+
     def answer_question(self, question: str) -> Tuple[str, List[str], int]:
 
-        # --- 初始化变量 ---
-        history = []  # [New] 用于存储结构化的推理链
+        # --- initialize ---
+        history = []
         dependency_analysis_history = []
         last_contexts = []
         retrieval_history = []
         round_count = 0
-        retrieved_chunks_set = set() if self.filter_repeats else None  # Track retrieved chunks if filtering
+        reasoning_step_counter = 0
+        retrieved_chunks_set = set() if self.filter_repeats else None
+
+        self.last_dependency_analysis = []
+        self.last_history = []
+        self.last_run_metadata = {}
+        self.last_perturbed_step_info = None
+        self.last_retrieval_history = []
 
         print(f"\n\n{Fore.CYAN}{self.MODEL_NAME} answering: {question}{Style.RESET_ALL}\n\n")
 
         # ===============================================
-        # == Stage 1: Warm up retrieval (作为第0步或初始背景) ==
+        # == Stage 1: Warm up retrieval ==
         # ===============================================
         if self.filter_repeats:
             new_contexts = self._retrieve_with_filter(question, retrieved_chunks_set)
@@ -394,40 +411,60 @@ Please format your response as a JSON object with these keys:
 
         last_contexts = new_contexts
 
-        # [New Logic] 处理 Warm-up 步骤
-        # 即使是 Warm-up，我们也可以把它看作是对原始问题的一次直接尝试
         warmup_step_result = self.process_step(question, question, new_contexts)
+        warmup_step_result, warmup_perturbation_log = self._maybe_perturb_step_result(
+            warmup_step_result,
+            step_type="initial_attempt",
+            reasoning_step_index=-1
+        )
 
-        # 将 Warm-up 结果加入历史
         history.append({
             "step_type": "initial_attempt",
             "query": question,
-            "summary": warmup_step_result["summary"],
-            "answer": warmup_step_result["answer"]
+            "summary": warmup_step_result.get("summary", ""),
+            "answer": warmup_step_result.get("answer", ""),
+            "perturbation_log": warmup_perturbation_log
         })
-        # [Modified] 直接传入 history，不需要再手动生成 info_summary 字符串了
+
         analysis = self.warm_up_analysis(question, history)
 
         if analysis["can_answer"]:
-            # In this case, the question can be answered with simple fact retrieval, without any dependency analysis
             print(
-                f"Warm-up analysis indicate the question can be answered with simple fact retrieval, without any dependency analysis.")
-            answer = self.generate_answer(question, history)  # 传入 history
+                "Warm-up analysis indicate the question can be answered with simple fact retrieval, without any dependency analysis.")
+            answer = self.generate_answer(question, history)
+
             self.last_dependency_analysis = []
-            self.last_history = history
+            self.last_history = history if self.save_history else []
+            self.last_retrieval_history = retrieval_history if self.save_history else []
+            self.last_run_metadata = {
+                "question": question,
+                "num_history_steps": len(history),
+                "num_reasoning_steps": reasoning_step_counter,
+                "has_reasoning_step": reasoning_step_counter > 0,
+                "perturbation_enabled": self.perturbation_enabled,
+                "perturbation_type": self.perturbation_type,
+                "perturbation_step_mode": self.perturbation_step_mode,
+                "perturbation_applied": False,
+                "experiment_tag": self.experiment_tag,
+                "rounds": round_count,
+                "early_stop_from_warmup": True,
+            }
+            self.last_perturbed_step_info = None
             return answer, last_contexts, round_count
+
         else:
             logger.info(
-                f"Warm-up analysis indicate the requirement of deeper reasoning-enhanced RAG. Now perform analysis with logical dependency graph.")
+                "Warm-up analysis indicate the requirement of deeper reasoning-enhanced RAG. Now perform analysis with logical dependency graph.")
             logger.info(f"Dependencies: {', '.join(analysis.get('dependencies', []))}")
 
-            # sort the dependencies, by first constructing the dependency graphs, then use topological sort to get the sorted dependencies
             sorted_dependencies = self._sort_dependencies(analysis["dependencies"], question)
             dependency_analysis_history.append({"sorted_dependencies": sorted_dependencies})
             logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
+
         # ===============================================
         # == Stage 2: agentic iterative retrieval ==
-        idx = 0  # used to track the current dependency index
+        # ===============================================
+        idx = 0
 
         while round_count < self.max_rounds and idx < len(sorted_dependencies):
             round_count += 1
@@ -439,23 +476,30 @@ Please format your response as a JSON object with these keys:
                     retrieved_chunks_set.add(chunk)
             else:
                 new_contexts = self.retrieve(current_query)
-            last_contexts = new_contexts  # Save current contexts
+            last_contexts = new_contexts
 
-            # [New Logic] 处理当前步骤
             step_result = self.process_step(question, current_query, new_contexts)
+            step_result, step_perturbation_log = self._maybe_perturb_step_result(
+                step_result,
+                step_type="reasoning_step",
+                reasoning_step_index=reasoning_step_counter
+            )
 
-            # Generate or refine information summary with new contexts
-            # 保存到数组/栈
             history.append({
                 "query": current_query,
                 "step_type": "reasoning_step",
-                "summary": step_result["summary"],
-                "answer": step_result["answer"]
+                "summary": step_result.get("summary", ""),
+                "answer": step_result.get("answer", ""),
+                "perturbation_log": step_perturbation_log
             })
+
+            if step_perturbation_log.get("perturbation_applied", False):
+                self.last_perturbed_step_info = step_perturbation_log
+
+            reasoning_step_counter += 1
 
             logger.info(f"Agentic retrieval at round {round_count} - Sub-answer: {step_result['answer']}")
 
-            # [New Logic] 判别器使用 history
             analysis = self.dependency_aware_rag(question, history, sorted_dependencies, idx)
 
             retrieval_history.append({
@@ -471,35 +515,72 @@ Please format your response as a JSON object with these keys:
             })
 
             if analysis["can_answer"]:
-                # Generate and return final answer
-                answer = self.generate_answer(question, history)  # 传入 history
-                self.last_dependency_analysis = []  # 需要根据你的需求适配 log
-                self.last_history = history
+                answer = self.generate_answer(question, history)
+
+                perturbation_applied = any(
+                    step.get("perturbation_log", {}).get("perturbation_applied", False)
+                    for step in history
+                )
+
+                self.last_dependency_analysis = dependency_analysis_history
+                self.last_history = history if self.save_history else []
+                self.last_retrieval_history = retrieval_history if self.save_history else []
+                self.last_run_metadata = {
+                    "question": question,
+                    "num_history_steps": len(history),
+                    "num_reasoning_steps": reasoning_step_counter,
+                    "has_reasoning_step": reasoning_step_counter > 0,
+                    "reasoning_step_indices": list(range(reasoning_step_counter)),
+                    "perturbation_enabled": self.perturbation_enabled,
+                    "perturbation_type": self.perturbation_type,
+                    "perturbation_step_mode": self.perturbation_step_mode,
+                    "perturbation_applied": perturbation_applied,
+                    "experiment_tag": self.experiment_tag,
+                    "rounds": round_count,
+                    "early_stop_from_warmup": False,
+                    "stopped_because_can_answer": True,
+                }
                 return answer, last_contexts, round_count
             else:
                 idx += 1
 
-        # If max rounds reached, generate best possible answer
         logger.info(f"Reached maximum rounds ({self.max_rounds}). Generating final answer...")
         answer = self.generate_answer(question, history)
-        self.last_history = history
+
+        perturbation_applied = any(
+            step.get("perturbation_log", {}).get("perturbation_applied", False)
+            for step in history
+        )
+
+        self.last_dependency_analysis = dependency_analysis_history
+        self.last_history = history if self.save_history else []
+        self.last_retrieval_history = retrieval_history if self.save_history else []
+        self.last_run_metadata = {
+            "question": question,
+            "num_history_steps": len(history),
+            "num_reasoning_steps": reasoning_step_counter,
+            "has_reasoning_step": reasoning_step_counter > 0,
+            "reasoning_step_indices": list(range(reasoning_step_counter)),
+            "perturbation_enabled": self.perturbation_enabled,
+            "perturbation_type": self.perturbation_type,
+            "perturbation_step_mode": self.perturbation_step_mode,
+            "perturbation_applied": perturbation_applied,
+            "experiment_tag": self.experiment_tag,
+            "rounds": round_count,
+            "early_stop_from_warmup": False,
+            "stopped_because_can_answer": False,
+        }
         return answer, last_contexts, round_count
 
     def _format_history_for_llm(self, history: List[Dict[str, Any]]) -> str:
         """
         将推理历史列表格式化为清晰的字符串，供LLM阅读。
-
-        Args:
-            history: 包含每一步推理信息的列表，格式如下：
-                     [{'query': '...', 'summary': '...', 'answer': '...'}, ...]
-        Returns:
-            String representation of the reasoning chain.
         """
         formatted_text = ""
         for i, step in enumerate(history):
             formatted_text += f"Step {i + 1}:\n"
-            formatted_text += f"  - Sub-Query: {step['query']}\n"
-            formatted_text += f"  - Context Summary: {step['summary']}\n"
-            formatted_text += f"  - Direct Answer: {step['answer']}\n\n"
+            formatted_text += f"  - Sub-Query: {step.get('query', '')}\n"
+            formatted_text += f"  - Context Summary: {step.get('summary', '')}\n"
+            formatted_text += f"  - Direct Answer: {step.get('answer', '')}\n\n"
 
         return formatted_text.strip()

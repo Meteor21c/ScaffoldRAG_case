@@ -5,7 +5,7 @@
       <paths name="logicRAG_ori">
         <serverdata>
           <mappings>
-            <mapping deploy="/LogicRAG_ENHANCED" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/LogicRAG_case1" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

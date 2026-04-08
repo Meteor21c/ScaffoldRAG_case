@@ -28,38 +28,47 @@ RAG_MODELS = {
 
 # Directory for checkpoints
 CHECKPOINT_DIR = os.path.join(RESULT_DIR, "checkpoints")
-DEFAULT_CHECKPOINT_INTERVAL = 5  # Default: save checkpoint every 5 questions
+DEFAULT_CHECKPOINT_INTERVAL = 5
 
 
 class RAGEvaluator:
     """Evaluator for RAG models."""
 
-    def __init__(self, model_name: str, corpus_path: str, max_rounds: int = 3, top_k: int = 5,
-                 eval_top_ks: List[int] = [5, 10], checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL):
-        """Initialize the evaluator with corpus path and parameters.
-        
-        Args:
-            model_name: Name of the RAG model to evaluate
-            corpus_path: Path to the corpus file
-            max_rounds: Maximum number of rounds for agentic RAG
-            top_k: Number of contexts to retrieve
-            eval_top_ks: List of k values for top-k accuracy evaluation
-            checkpoint_interval: Number of questions to process before saving checkpoint
+    def __init__(
+        self,
+        model_name: str,
+        corpus_path: str,
+        max_rounds: int = 3,
+        top_k: int = 5,
+        eval_top_ks: List[int] = [5, 10],
+        checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+        perturbation_enabled: bool = False,
+        perturbation_type: str = "none",
+        perturbation_step_mode: str = "first_reasoning_step",
+        save_history: bool = False,
+        experiment_tag: str = "baseline",
+        filter_repeats: bool = False,
+    ):
+        """
+        Initialize the evaluator with corpus path and parameters.
         """
         self.model_name = model_name
         self.corpus_path = corpus_path
         self.max_rounds = max_rounds
         self.top_k = top_k
-        self.eval_top_ks = sorted(eval_top_ks)  # Sort to ensure consistent processing
+        self.eval_top_ks = sorted(eval_top_ks)
         self.checkpoint_interval = checkpoint_interval
 
-        # Create result directory if it doesn't exist
-        os.makedirs(RESULT_DIR, exist_ok=True)
+        self.perturbation_enabled = perturbation_enabled
+        self.perturbation_type = perturbation_type
+        self.perturbation_step_mode = perturbation_step_mode
+        self.save_history = save_history
+        self.experiment_tag = experiment_tag
+        self.filter_repeats = filter_repeats
 
-        # Create checkpoint directory if it doesn't exist
+        os.makedirs(RESULT_DIR, exist_ok=True)
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-        # Initialize the RAG model
         self._initialize_model()
 
     def _initialize_model(self):
@@ -67,14 +76,19 @@ class RAGEvaluator:
         if self.model_name not in RAG_MODELS:
             raise ValueError(f"Unknown RAG model: {self.model_name}")
 
-        # Create model instance
         model_class = RAG_MODELS[self.model_name]
-        self.model = model_class(self.corpus_path)
+        self.model = model_class(
+            corpus_path=self.corpus_path,
+            filter_repeats=self.filter_repeats,
+            perturbation_enabled=self.perturbation_enabled,
+            perturbation_type=self.perturbation_type,
+            perturbation_step_mode=self.perturbation_step_mode,
+            save_history=self.save_history,
+            experiment_tag=self.experiment_tag,
+        )
 
-        # Configure model
         self.model.set_top_k(self.top_k)
 
-        # Set max rounds for agentic models
         if hasattr(self.model, 'set_max_rounds'):
             self.model.set_max_rounds(self.max_rounds)
 
@@ -82,14 +96,18 @@ class RAGEvaluator:
 
     def evaluate_question(self, question: str, gold_answer: str) -> Dict:
         """Evaluate the model on a single question."""
-        # Run the model on the question
         start_time = time.time()
 
         answer, contexts, rounds = self.model.answer_question(question)
         elapsed_time = time.time() - start_time
 
-        # Evaluate answer with LLM
         is_correct = evaluate_with_llm(question, answer, gold_answer)
+
+        metadata = getattr(self.model, "last_run_metadata", {})
+        history = getattr(self.model, "last_history", [])
+        dependency_analysis = getattr(self.model, "last_dependency_analysis", [])
+        retrieval_history = getattr(self.model, "last_retrieval_history", [])
+        perturbed_step_info = getattr(self.model, "last_perturbed_step_info", None)
 
         result = {
             "question": question,
@@ -98,12 +116,30 @@ class RAGEvaluator:
             "contexts": contexts,
             "time": elapsed_time,
             "rounds": rounds,
-            "is_correct": is_correct
+            "is_correct": is_correct,
+
+            # ===== experiment logs =====
+            "history": history if self.save_history else [],
+            "metadata": metadata,
+            "dependency_analysis": dependency_analysis,
+            "retrieval_history": retrieval_history if self.save_history else [],
+            "num_history_steps": metadata.get("num_history_steps", 0),
+            "num_reasoning_steps": metadata.get("num_reasoning_steps", 0),
+            "has_reasoning_step": metadata.get("has_reasoning_step", False),
+            "perturbation_enabled": metadata.get("perturbation_enabled", False),
+            "perturbation_type": metadata.get("perturbation_type", "none"),
+            "perturbation_step_mode": metadata.get("perturbation_step_mode", "first_reasoning_step"),
+            "perturbation_applied": metadata.get("perturbation_applied", False),
+            "experiment_tag": metadata.get("experiment_tag", self.experiment_tag),
+            "early_stop_from_warmup": metadata.get("early_stop_from_warmup", False),
         }
 
-        # Add dependency analysis for interpretable models
-        if hasattr(self.model, 'last_dependency_analysis'):
-            result["dependency_analysis"] = self.model.last_dependency_analysis
+        if perturbed_step_info is not None:
+            result["perturbed_step_info"] = perturbed_step_info
+            result["original_summary"] = perturbed_step_info.get("original_summary", "")
+            result["perturbed_summary"] = perturbed_step_info.get("perturbed_summary", "")
+            result["original_answer"] = perturbed_step_info.get("original_answer", "")
+            result["perturbed_answer"] = perturbed_step_info.get("perturbed_answer", "")
 
         return result
 
@@ -112,29 +148,24 @@ class RAGEvaluator:
         total = len(answers)
         found_in_context = 0
 
-        # Initialize answer_in_top_k counters for each k in eval_top_ks
         answer_in_top_k = {k: 0 for k in self.eval_top_ks}
 
         for contexts, answer in zip(retrieved_contexts, answers):
             normalized_answer = normalize_answer(answer)
 
-            # Check if answer is in any context
             for i, context in enumerate(contexts):
                 if normalized_answer in normalize_answer(context):
                     found_in_context += 1
-                    # Update counters for each k value
                     for k in self.eval_top_ks:
                         if i < k:
                             answer_in_top_k[k] += 1
                     break
 
-        # Prepare result dictionary
         result = {
             "answer_found_in_context": found_in_context / total,
             "total_questions": total
         }
 
-        # Add top-k metrics to result
         for k in self.eval_top_ks:
             result[f"answer_in_top{k}"] = answer_in_top_k[k] / total
 
@@ -148,18 +179,23 @@ class RAGEvaluator:
 
     def _save_checkpoint(self, results: List[Dict], metrics: Dict, processed_count: int, output_file: str):
         """Save a checkpoint of current evaluation progress."""
-
-        # If the last "answer" is empty in the results, it indicates that we have lost connection to the LLM API
-        # We should not save the checkpoint in this case, and we should terminate the whole pipeline
         if results[-1]["answer"] == "":
             print("\n\n\033[91mLost connection to the LLM API, skipping checkpoint save\033[0m\n\n")
-            exit(1)  # Use exit code 1 to indicate error condition
+            exit(1)
 
         checkpoint = {
             "model": self.model_name,
             "metrics": metrics,
             "results": results,
             "processed_count": processed_count,
+            "experiment": {
+                "experiment_tag": self.experiment_tag,
+                "perturbation_enabled": self.perturbation_enabled,
+                "perturbation_type": self.perturbation_type,
+                "perturbation_step_mode": self.perturbation_step_mode,
+                "save_history": self.save_history,
+                "filter_repeats": self.filter_repeats,
+            },
             "token_cost": {
                 "prompt": TOKEN_COST["prompt"],
                 "completion": TOKEN_COST["completion"]
@@ -183,7 +219,6 @@ class RAGEvaluator:
             with open(checkpoint_path, 'r', encoding='utf-8') as f:
                 checkpoint = json.load(f)
 
-            # Restore token costs
             if "token_cost" in checkpoint:
                 TOKEN_COST["prompt"] = checkpoint["token_cost"]["prompt"]
                 TOKEN_COST["completion"] = checkpoint["token_cost"]["completion"]
@@ -198,70 +233,61 @@ class RAGEvaluator:
 
     def run_single_model_evaluation(self, eval_data: List[Dict], output_file: str = "evaluation_results.json"):
         """Run evaluation of a single model on the given evaluation data."""
-        # Try to load checkpoint
         results, metrics, processed_count = self._load_checkpoint(output_file)
 
-        # Skip already processed questions
         if processed_count > 0:
             eval_data = eval_data[processed_count:]
             logger.info(
                 f"Resuming from checkpoint: {processed_count} questions already processed, {len(eval_data)} remaining")
 
-        # If all questions were already processed
         if not eval_data:
             logger.info("All questions were already processed in previous run.")
-            # Load full results from final output
             output_path = os.path.join(RESULT_DIR, output_file)
             if os.path.exists(output_path):
                 with open(output_path, 'r', encoding='utf-8') as f:
                     evaluation_summary = json.load(f)
                 return evaluation_summary
 
-        # If starting fresh, initialize metrics and reset token costs
         if not metrics:
-            # Reset token costs for the current model evaluation
             TOKEN_COST["prompt"] = 0
             TOKEN_COST["completion"] = 0
 
-            # Initialize metrics dictionary with dynamic top-k keys
             metrics = {
                 "total_time": 0,
                 "answer_coverage": 0,
                 "answer_accuracy": 0,
                 "string_accuracy": 0,
                 "string_precision": 0,
-                "string_recall": 0
+                "string_recall": 0,
+                "total_rounds": 0,
+
+                # ===== experiment metrics =====
+                "reasoning_sample_count": 0,
+                "perturbation_applied_count": 0,
+                "warmup_early_stop_count": 0,
             }
 
-            # Add top-k hits for each k in eval_top_ks
             for k in self.eval_top_ks:
                 metrics[f"top{k}_hits"] = 0
-
-            # Add rounds tracking
-            metrics["total_rounds"] = 0
         else:
             logger.info(
                 f"Restored token costs - Prompt: {TOKEN_COST['prompt']}, Completion: {TOKEN_COST['completion']}")
 
-        # Evaluation metrics
         total_questions = len(eval_data) + processed_count
 
         for i, item in enumerate(tqdm(eval_data, desc=f"Evaluating {self.model_name}")):
             question = item['question']
             gold_answer = item['answer']
 
-            # Evaluate the model on this question
             result = self.evaluate_question(
                 question=question,
                 gold_answer=gold_answer
             )
             results.append(result)
 
-            # Update metrics
             metrics["total_time"] += result["time"]
             normalized_gold = normalize_answer(gold_answer)
 
-            # String-based evaluation
             string_metrics = string_based_evaluation(
                 result["answer"],
                 gold_answer
@@ -270,50 +296,52 @@ class RAGEvaluator:
             metrics["string_precision"] += string_metrics["precision"]
             metrics["string_recall"] += string_metrics["recall"]
 
-            # Check retrieval coverage
             for j, ctx in enumerate(result["contexts"]):
                 if normalized_gold in normalize_answer(ctx):
                     metrics["answer_coverage"] += 1
-                    # Update counters for each k value
                     for k in self.eval_top_ks:
                         if j < k:
                             metrics[f"top{k}_hits"] += 1
                     break
 
-            # Update rounds
             if "rounds" in result:
                 metrics["total_rounds"] += result["rounds"]
 
-            # Evaluate answer using LLM
             if result["is_correct"]:
                 metrics["answer_accuracy"] += 1
 
-            # Save checkpoint at regular intervals
+            # ===== experiment counters =====
+            if result.get("has_reasoning_step", False):
+                metrics["reasoning_sample_count"] += 1
+            if result.get("perturbation_applied", False):
+                metrics["perturbation_applied_count"] += 1
+            if result.get("early_stop_from_warmup", False):
+                metrics["warmup_early_stop_count"] += 1
+
             current_count = processed_count + i + 1
             if (current_count % self.checkpoint_interval == 0) or (i == len(eval_data) - 1):
                 self._save_checkpoint(results, metrics, current_count, output_file)
 
-        # Calculate average metrics
         avg_metrics = {
             "avg_time": metrics["total_time"] / total_questions,
             "answer_coverage": metrics["answer_coverage"] / total_questions * 100,
             "answer_accuracy": metrics["answer_accuracy"] / total_questions * 100,
             "string_accuracy": metrics["string_accuracy"] / total_questions * 100,
             "string_precision": metrics["string_precision"] / total_questions * 100,
-            "string_recall": metrics["string_recall"] / total_questions * 100
+            "string_recall": metrics["string_recall"] / total_questions * 100,
+            "avg_rounds": metrics["total_rounds"] / total_questions,
+            "reasoning_sample_rate": metrics["reasoning_sample_count"] / total_questions * 100,
+            "perturbation_applied_rate": metrics["perturbation_applied_count"] / total_questions * 100,
+            "warmup_early_stop_rate": metrics["warmup_early_stop_count"] / total_questions * 100,
         }
 
-        # Add top-k coverage (renamed from accuracy) for each k in eval_top_ks
         for k in self.eval_top_ks:
             avg_metrics[f"top{k}_coverage"] = metrics[f"top{k}_hits"] / total_questions * 100
 
-        # Add average rounds
-        avg_metrics["avg_rounds"] = metrics["total_rounds"] / total_questions
-
-        # Organize metrics by category
         organized_metrics = {
             "performance": {
-                "avg_time": avg_metrics["avg_time"]
+                "avg_time": avg_metrics["avg_time"],
+                "avg_rounds": avg_metrics["avg_rounds"],
             },
             "string_based": {
                 "accuracy": avg_metrics["string_accuracy"],
@@ -325,73 +353,75 @@ class RAGEvaluator:
             },
             "retrieval": {
                 "answer_coverage": avg_metrics["answer_coverage"]
+            },
+            "experiment": {
+                "experiment_tag": self.experiment_tag,
+                "perturbation_enabled": self.perturbation_enabled,
+                "perturbation_type": self.perturbation_type,
+                "perturbation_step_mode": self.perturbation_step_mode,
+                "save_history": self.save_history,
+                "filter_repeats": self.filter_repeats,
+                "reasoning_sample_count": metrics["reasoning_sample_count"],
+                "reasoning_sample_rate": avg_metrics["reasoning_sample_rate"],
+                "perturbation_applied_count": metrics["perturbation_applied_count"],
+                "perturbation_applied_rate": avg_metrics["perturbation_applied_rate"],
+                "warmup_early_stop_count": metrics["warmup_early_stop_count"],
+                "warmup_early_stop_rate": avg_metrics["warmup_early_stop_rate"],
             }
         }
 
-        # Add rounds
-        organized_metrics["performance"]["avg_rounds"] = avg_metrics["avg_rounds"]
-
-        # Add token cost metrics
         if total_questions > 0:
             organized_metrics["performance"]["avg_prompt_tokens"] = TOKEN_COST["prompt"] / total_questions
             organized_metrics["performance"]["avg_completion_tokens"] = TOKEN_COST["completion"] / total_questions
-            organized_metrics["performance"]["avg_total_tokens"] = (TOKEN_COST["prompt"] + TOKEN_COST[
-                "completion"]) / total_questions
+            organized_metrics["performance"]["avg_total_tokens"] = (
+                TOKEN_COST["prompt"] + TOKEN_COST["completion"]
+            ) / total_questions
         else:
             organized_metrics["performance"]["avg_prompt_tokens"] = 0
             organized_metrics["performance"]["avg_completion_tokens"] = 0
             organized_metrics["performance"]["avg_total_tokens"] = 0
 
-        # Add top-k coverage metrics
         for k in self.eval_top_ks:
             organized_metrics["retrieval"][f"top{k}_coverage"] = avg_metrics[f"top{k}_coverage"]
 
-        # Add raw metrics for backwards compatibility
         organized_metrics["raw"] = metrics
 
-        # Prepare final evaluation summary
         evaluation_summary = {
             "model": self.model_name,
             "metrics": organized_metrics,
             "results": results
         }
 
-        # Save results
         save_results(
             results=evaluation_summary,
             output_file=output_file,
             results_dir=RESULT_DIR
         )
 
-        # Log results in three sections
         logger.info(f"\nEvaluation Summary for {self.model_name}:")
-
-        # Performance metrics
         logger.info(f"Average time per question: {avg_metrics['avg_time']:.2f} seconds")
         logger.info(f"Average rounds per question: {avg_metrics['avg_rounds']:.2f}")
-
-        # Log token costs
         logger.info(f"Average prompt tokens per question: {organized_metrics['performance']['avg_prompt_tokens']:.2f}")
-        logger.info(
-            f"Average completion tokens per question: {organized_metrics['performance']['avg_completion_tokens']:.2f}")
+        logger.info(f"Average completion tokens per question: {organized_metrics['performance']['avg_completion_tokens']:.2f}")
         logger.info(f"Average total tokens per question: {organized_metrics['performance']['avg_total_tokens']:.2f}")
 
-        # 1. String-based metrics
         logger.info("\n1. String-based Metrics:")
         logger.info(f"  • Accuracy: {avg_metrics['string_accuracy']:.2f}%")
         logger.info(f"  • Precision: {avg_metrics['string_precision']:.2f}%")
         logger.info(f"  • Recall: {avg_metrics['string_recall']:.2f}%")
 
-        # 2. LLM evaluated metrics
         logger.info("\n2. LLM Evaluated Metrics:")
         logger.info(f"  • Answer Accuracy: {avg_metrics['answer_accuracy']:.2f}%")
 
-        # 3. Retrieval performance
         logger.info("\n3. Retrieval Performance:")
         logger.info(f"  • Answer Coverage: {avg_metrics['answer_coverage']:.2f}%")
 
-        # Log top-k coverage metrics
         for k in self.eval_top_ks:
             logger.info(f"  • Top-{k} Coverage: {avg_metrics[f'top{k}_coverage']:.2f}%")
+
+        logger.info("\n4. Experiment Metrics:")
+        logger.info(f"  • Reasoning Sample Rate: {avg_metrics['reasoning_sample_rate']:.2f}%")
+        logger.info(f"  • Perturbation Applied Rate: {avg_metrics['perturbation_applied_rate']:.2f}%")
+        logger.info(f"  • Warm-up Early Stop Rate: {avg_metrics['warmup_early_stop_rate']:.2f}%")
 
         return evaluation_summary

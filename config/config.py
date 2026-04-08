@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # OpenAI API Configuration
-OPENAI_API_KEY = "xxxx"
-OPENAI_BASE_URL = "xxxxx"
+OPENAI_API_KEY = "sk-ozzzzzF"
+OPENAI_BASE_URL = "zzzz"
 
 # API Rate Limiting Configuration
 CALLS_PER_MINUTE = 20
